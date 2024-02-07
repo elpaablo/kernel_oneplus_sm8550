@@ -44,13 +44,7 @@
 #ifdef HAS_TESTING_FEATURE
 #include "syna_tcm2_testing.h"
 #endif
-#ifdef BUILD_BY_BAZEL
-#include <soc/oplus/touchpanel_event_notify.h>/* kernel 6.1 */
-#else
 #include "../touchpanel_notify/touchpanel_event_notify.h"
-#endif
-
-#include "touchpanel_healthinfo/touchpanel_healthinfo.h"
 
 #if (KERNEL_VERSION(5, 9, 0) <= LINUX_VERSION_CODE) || \
 	defined(HAVE_UNLOCKED_IOCTL)
@@ -1092,16 +1086,6 @@ static int syna_cdev_insert_fifo(struct syna_tcm *tcm,
 
 	syna_pal_mutex_lock(&g_fifo_queue_mutex);
 
-	if (tcm->fifo_remaining_frame < 4) {
-		tcm->frame_over_cnt_report_en = 1;
-	}
-	if ((tcm->fifo_remaining_frame > 4) && (tcm->health_monitor_support)
-		    && (tcm->frame_over_cnt_report_en == 1)) {
-		tcm->frame_over_cnt_report_en = 0;
-		LOGE("fifo_remaining_frame_over.\n");
-		tp_healthinfo_report(&tcm->monitor_data, HEALTH_REPORT, "fifo_remaining_frame_over_cnt");
-	}
-
 	/* check queue buffer limit */
 	if (tcm->fifo_remaining_frame >= FIFO_QUEUE_MAX_FRAMES) {
 		if (tcm->fifo_remaining_frame != pre_remaining_frames)
@@ -1117,9 +1101,6 @@ static int syna_cdev_insert_fifo(struct syna_tcm *tcm,
 		kfree(pfifo_data_temp);
 		pre_remaining_frames = tcm->fifo_remaining_frame;
 		tcm->fifo_remaining_frame--;
-		if (tcm->health_monitor_support) {
-			tp_healthinfo_report(&tcm->monitor_data, HEALTH_REPORT, "FIFO_QUEUE_MAX_CNT");
-		}
 	} else if (pre_remaining_frames >= FIFO_QUEUE_MAX_FRAMES) {
 		LOGE("Reached limit, dropped oldest frame, remaining:%d\n",
 			tcm->fifo_remaining_frame);
@@ -3227,11 +3208,13 @@ static int syna_cdev_release(struct inode *inp, struct file *filp)
 	tcm = dev_get_drvdata(p_dev);
 	IF_ARG_NULL_OUT(tcm);
 
+	mutex_lock(&tcm->mutex);
 	syna_pal_mutex_lock(&tcm->extif_mutex);
 
 	if (IS_REMOVE == tcm->driver_current_state) {
 		LOGE("%s:driver is remove!! do not use any ioctl\n", __func__);
 		syna_pal_mutex_unlock(&tcm->extif_mutex);
+		mutex_unlock(&tcm->mutex);
 		return -EINVAL;
 	};
 
@@ -3239,6 +3222,7 @@ static int syna_cdev_release(struct inode *inp, struct file *filp)
 		LOGN("cdev already closed, %d\n",
 			tcm->char_dev_ref_count);
 		syna_pal_mutex_unlock(&tcm->extif_mutex);
+		mutex_unlock(&tcm->mutex);
 		return 0;
 	}
 
@@ -3256,6 +3240,7 @@ static int syna_cdev_release(struct inode *inp, struct file *filp)
 	syna_cdev_clean_queue(tcm);
 #endif
 	syna_pal_mutex_unlock(&tcm->extif_mutex);
+	mutex_unlock(&tcm->mutex);
 
 	g_sysfs_io_polling_interval = 0;
 

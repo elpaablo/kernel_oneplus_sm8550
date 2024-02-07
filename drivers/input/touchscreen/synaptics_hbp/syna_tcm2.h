@@ -44,13 +44,9 @@
 #include "syna_tcm2_platform.h"
 #include "tcm/synaptics_touchcom_core_dev.h"
 #include "tcm/synaptics_touchcom_func_touch.h"
-#ifdef BUILD_BY_BAZEL
 #include "tp_devices.h"
 #include "touchpanel_common.h"
-#else
-#include "../oplus_touchscreen_v2/tp_devices.h"
-#include "../oplus_touchscreen_v2/touchpanel_common.h"
-#endif
+
 
 #define PLATFORM_DRIVER_NAME "synaptics_tcm_hbp"
 
@@ -559,6 +555,14 @@ static inline unsigned int le4_to_uint(const unsigned char *src)
 	       (unsigned int)src[3] * 0x1000000;
 }
 
+struct syna_tcm_test {
+	unsigned int num_of_reports;
+	unsigned char report_type;
+	unsigned int report_index;
+	struct tcm_buffer report;
+	struct tcm_buffer test_resp;
+	struct tcm_buffer test_out;
+};
 /**
  * @brief: context of the synaptics linux-based driver
  *
@@ -570,6 +574,9 @@ struct syna_tcm {
 
 	/* TouchComm device core context */
 	struct tcm_dev *tcm_dev;
+
+	struct syna_tcm_test *test_hcd;
+	struct completion report_complete;
 
 	/* PLatform device driver */
 	struct platform_device *pdev;
@@ -698,12 +705,6 @@ struct syna_tcm {
 	struct com_test_data com_test_data;	/*test comon data*/
 	struct tcm_engineer_test_operations   *engineer_ops;     /*call_back function*/
 	bool in_test_process;
-
-	bool health_monitor_support;                        /*health_monitor is used*/
-	struct monitor_data    monitor_data;                /*health monitor data*/
-
-	bool exception_upload_support;
-	struct exception_data    exception_data;            /*exception_data monitor data*/
 
 	/* fifo to pass the data to userspace */
 	unsigned int fifo_remaining_frame;
@@ -850,6 +851,56 @@ void syna_cdev_update_power_state_report_queue(struct syna_tcm *tcm, bool wakeup
 #endif
 
 #endif
+
+
+
+#define INIT_BUFFER(buffer, is_clone) \
+	mutex_init(&buffer.buf_mutex); \
+
+#define LOCK_BUFFER(buffer) \
+	mutex_lock(&buffer.buf_mutex)
+
+#define UNLOCK_BUFFER(buffer) \
+	mutex_unlock(&buffer.buf_mutex)
+
+#define RELEASE_BUFFER(buffer) \
+	do { \
+        if (buffer.clone == false) { \
+			kfree(buffer.buf); \
+			buffer.buf_size = 0; \
+			buffer.data_length = 0; \
+        } \
+	} while (0)
+
+struct syna_tcm_report {
+	unsigned char id;
+	struct tcm_buffer buffer;
+};
+
+static inline int syna_tcm_alloc_mem(struct tcm_buffer *buffer,
+					 unsigned int size)
+{
+	if (size > buffer->buf_size) {
+		if (buffer->buf != NULL) {
+			kfree(buffer->buf);
+		}
+		buffer->buf = kzalloc(size, GFP_KERNEL);
+
+		if (!(buffer->buf)) {
+			//TPD_INFO("%s: Failed to allocate memory, size %d\n", __func__, size);
+			buffer->buf_size = 0;
+			buffer->data_length = 0;
+			return -ENOMEM;
+		}
+		buffer->buf_size = size;
+	}
+
+	memset(buffer->buf, 0, buffer->buf_size);
+	buffer->data_length = 0;
+
+	return 0;
+}
+
 
 #endif /* end of _SYNAPTICS_TCM2_DRIVER_H_ */
 

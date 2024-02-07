@@ -15,12 +15,7 @@
 #include <linux/rtc.h>
 #include <linux/syscalls.h>
 #include <linux/version.h>
-#ifdef BUILD_BY_BAZEL
-#include <soc/oplus/touchpanel_event_notify.h>/* kernel 6.1 */
-#else
 #include "../touchpanel_notify/touchpanel_event_notify.h"
-#endif
-#include "touchpanel_healthinfo/touchpanel_healthinfo.h"
 #include "touchpanel_autotest/touchpanel_autotest.h"
 #include "touch_comon_api/touch_comon_api.h"
 #include "tcm/synaptics_touchcom_func_base.h"
@@ -742,17 +737,8 @@ DECLARE_PROC_OPS(proc_aging_test_ops, simple_open, proc_aging_test_read, proc_ag
 static int tp_health_monitor_read_func(struct seq_file *s, void *v)
 {
 	struct syna_tcm *tcm = s->private;
-	struct monitor_data *monitor_data = &tcm->monitor_data;
 
 	mutex_lock(&tcm->mutex);
-
-	if (monitor_data->fw_version) {
-		memset(monitor_data->fw_version, 0, MAX_DEVICE_VERSION_LENGTH);
-		strncpy(monitor_data->fw_version, tcm->panel_data.manufacture_info.version,
-			strlen(tcm->panel_data.manufacture_info.version));
-	}
-
-	tp_healthinfo_read(s, monitor_data);
 
 	mutex_unlock(&tcm->mutex);
 	return 0;
@@ -761,7 +747,6 @@ static int tp_health_monitor_read_func(struct seq_file *s, void *v)
 static ssize_t health_monitor_control(struct file *file, const char __user *buf, size_t count, loff_t *lo)
 {
 	struct syna_tcm *tcm = PDE_DATA(file_inode(file));
-	struct monitor_data *monitor_data = &tcm->monitor_data;
 	char buffer[4] = {0};
 	int tmp = 0;
 
@@ -775,7 +760,6 @@ static ssize_t health_monitor_control(struct file *file, const char __user *buf,
 	}
 
 	if (1 == sscanf(buffer, "%d", &tmp) && tmp == 0) {
-		tp_healthinfo_clear(monitor_data);
 	} else {
 		TPD_INFO("invalid operation\n");
 	}
@@ -791,6 +775,200 @@ static int health_monitor_open(struct inode *inode, struct file *file)
 }
 
 DECLARE_PROC_OPS(tp_health_monitor_proc_fops, health_monitor_open, seq_read, health_monitor_control, single_release);
+
+/*proc/touchpanel/debug_info/baseline*/
+static int tp_baseline_debug_read_func(struct seq_file *s, void *v)
+{
+	struct syna_tcm *tcm = s->private;
+	struct debug_info_proc_operations *debug_info_ops;
+
+	if (!tcm) {
+		return 0;
+	}
+
+	debug_info_ops = (struct debug_info_proc_operations *)(tcm->debug_info_ops);
+
+	if (!debug_info_ops) {
+		TP_INFO(tcm->tp_index, "debug_info_ops==NULL");
+		return 0;
+	}
+
+	if (!debug_info_ops->baseline_read
+			&& !debug_info_ops->baseline_blackscreen_read) {
+		seq_printf(s, "Not support baseline proc node\n");
+		return 0;
+	}
+
+	/*the diff  is big than one page, so do twice.*/
+	if (s->size <= (PAGE_SIZE * 2)) {
+		s->count = s->size;
+		TPD_INFO("%s, %d, size check failed, %zu\n", __func__, __LINE__, s->size);
+		return 0;
+	}
+
+	if (tcm->tcm_dev->is_sleep) {
+		seq_printf(s, "Not in resume over state\n");
+		return 0;
+	}
+
+	mutex_lock(&tcm->mutex);
+	if (tcm->tcm_dev->is_sleep) {  /* add gesture enable */
+		if (debug_info_ops->baseline_blackscreen_read) {
+			debug_info_ops->baseline_blackscreen_read(s, tcm);
+		}
+	} else {
+		if (debug_info_ops->baseline_read) {
+			debug_info_ops->baseline_read(s, tcm);
+		}
+	}
+
+	/*step6: return to normal mode*/
+	if (syna_tcm_reset(tcm->tcm_dev) < 0) {
+		TPD_INFO("%s, %d, sw reset failed.\n", __func__, __LINE__);
+	}
+
+	mutex_unlock(&tcm->mutex);
+
+	return 0;
+}
+
+static int data_baseline_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, tp_baseline_debug_read_func, PDE_DATA(inode));
+}
+
+DECLARE_PROC_OPS(tp_baseline_data_proc_fops, data_baseline_open, seq_read, NULL, single_release);
+
+/*proc/touchpanel/debug_info/delta*/
+static int tp_delta_debug_read_func(struct seq_file *s, void *v)
+{
+	struct syna_tcm *tcm = s->private;
+	struct debug_info_proc_operations *debug_info_ops;
+
+	if (!tcm) {
+		return 0;
+	}
+
+	debug_info_ops = (struct debug_info_proc_operations *)tcm->debug_info_ops;
+
+	if (!debug_info_ops) {
+		return 0;
+	}
+
+	if (!debug_info_ops->delta_read) {
+		seq_printf(s, "Not support delta proc node\n");
+		return 0;
+	}
+
+
+	/*the diff  is big than one page, so do twice.*/
+	if (s->size <= (PAGE_SIZE * 2)) {
+		s->count = s->size;
+		return 0;
+	}
+
+	if (tcm->tcm_dev->is_sleep) {
+		seq_printf(s, "Not in resume over state\n");
+		return 0;
+	}
+
+	mutex_lock(&tcm->mutex);
+	debug_info_ops->delta_read(s, tcm);
+	mutex_unlock(&tcm->mutex);
+
+	return 0;
+}
+
+static int data_delta_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, tp_delta_debug_read_func, PDE_DATA(inode));
+}
+
+DECLARE_PROC_OPS(tp_delta_data_proc_fops, data_delta_open, seq_read, NULL, single_release);
+
+/*proc/touchpanel/debug_info/self_delta*/
+static int tp_self_delta_debug_read_func(struct seq_file *s, void *v)
+{
+	struct syna_tcm *tcm = s->private;
+	struct debug_info_proc_operations *debug_info_ops;
+
+	if (!tcm) {
+		return 0;
+	}
+
+	debug_info_ops = (struct debug_info_proc_operations *)tcm->debug_info_ops;
+
+	if (!debug_info_ops) {
+		LOGE("WXY: %s, %d\n", __func__, __LINE__);
+		return 0;
+	}
+
+	if (!debug_info_ops->self_delta_read) {
+		LOGE("WXY: %s, %d\n", __func__, __LINE__);
+		seq_printf(s, "Not support self_delta proc node\n");
+		return 0;
+	}
+
+	if (tcm->tcm_dev->is_sleep) {
+		seq_printf(s, "Not in resume over state\n");
+		return 0;
+	}
+
+	mutex_lock(&tcm->mutex);
+	debug_info_ops->self_delta_read(s, tcm);
+	mutex_unlock(&tcm->mutex);
+
+	return 0;
+}
+
+static int data_self_delta_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, tp_self_delta_debug_read_func, PDE_DATA(inode));
+}
+
+DECLARE_PROC_OPS(tp_self_delta_data_proc_fops, data_self_delta_open, seq_read, NULL, single_release);
+
+
+/*proc/touchpanel/debug_info/self_raw*/
+static int tp_self_raw_debug_read_func(struct seq_file *s, void *v)
+{
+	struct syna_tcm *tcm = s->private;
+	struct debug_info_proc_operations *debug_info_ops;
+
+	if (!tcm) {
+		return 0;
+	}
+
+	debug_info_ops = (struct debug_info_proc_operations *)tcm->debug_info_ops;
+
+	if (!debug_info_ops) {
+		TPD_INFO("%s, %d\n", __func__, __LINE__);
+		return 0;
+	}
+
+	if (!debug_info_ops->self_raw_read) {
+		seq_printf(s, "Not support self_raw proc node\n");
+		return 0;
+	}
+
+	if (tcm->tcm_dev->is_sleep) {
+		seq_printf(s, "Not in resume over state\n");
+		return 0;
+	}
+
+	mutex_lock(&tcm->mutex);
+	debug_info_ops->self_raw_read(s, tcm);
+	mutex_unlock(&tcm->mutex);
+
+	return 0;
+}
+
+static int data_self_raw_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, tp_self_raw_debug_read_func, PDE_DATA(inode));
+}
+
+DECLARE_PROC_OPS(tp_self_raw_data_proc_fops, data_self_raw_open, seq_read, NULL, single_release);
 
 /*proc/touchpanel/debug_info/main_register*/
 static int tp_main_register_read_func(struct seq_file *s, void *v)
@@ -857,10 +1035,16 @@ static int init_debug_info_proc(struct syna_tcm *tcm,
 
 	tp_proc_node proc_debug_node[] = {
 #ifndef CONFIG_REMOVE_OPLUS_FUNCTION
+		/* {"data_limit", 0666, NULL, &tp_limit_data_proc_fops, tcm, false, true}, show limit data interface*/
+		{"baseline", 0666, NULL, &tp_baseline_data_proc_fops, tcm, false, true},/* show baseline data interface*/
+
+		{"delta", 0666, NULL, &tp_delta_data_proc_fops, tcm, false, true},/* show delta interface*/
+		{"self_delta", 0666, NULL, &tp_self_delta_data_proc_fops, tcm, false, true},/* show self delta interface*/
+
+		{"self_raw", 0666, NULL, &tp_self_raw_data_proc_fops, tcm, false, true},/* show self_raw interface*/
 		{"main_register", 0666, NULL, &tp_main_register_proc_fops, tcm, false, true},/* show main_register interface*/
 		{
-			"health_monitor", 0666, NULL, &tp_health_monitor_proc_fops, tcm, false,
-			tcm->health_monitor_support
+			"health_monitor", 0666, NULL, &tp_health_monitor_proc_fops, tcm, false, false
 		},
 #endif
 	};

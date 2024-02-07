@@ -52,13 +52,7 @@
 #endif
 #include "touchpanel_proc.h"
 #include "synaptics_common.h"
-#include "touchpanel_healthinfo/touchpanel_healthinfo.h"
-#include "touchpanel_healthinfo/touchpanel_exception.h"
-#ifdef BUILD_BY_BAZEL
-#include <soc/oplus/touchpanel_event_notify.h>/* kernel 6.1 */
-#else
 #include "../touchpanel_notify/touchpanel_event_notify.h"
-#endif
 #include "touchpanel_autotest/touchpanel_autotest.h"
 #include "touch_comon_api/touch_comon_api.h"
 
@@ -130,8 +124,11 @@ static unsigned char custom_touch_format[] = {
  *           is going to suspend stage.
  */
 #define POWER_ALIVE_AT_SUSPEND
+static void syna_delta_read(struct seq_file *s, void *chip_data);
+static void syna_baseline_read(struct seq_file *s, void *chip_data);
 static void syna_main_register(struct seq_file *s, void *chip_data);
-
+static void syna_reserve_read(struct seq_file *s, void *chip_data);
+static void syna_tcm_test_report(struct syna_tcm *tcm_info, u32 code);
 /**
  * syna_dev_update_lpwg_status()
  *
@@ -904,17 +901,6 @@ exit:
 	return retval;
 }
 
-static irqreturn_t tp_top_irq_thread_fn(int irq, void *data)
-{
-	struct syna_tcm *tcm = data;
-
-	if (tcm->input_dev && tcm->primary_timestamp_enabled) {
-		input_set_timestamp(tcm->input_dev, ktime_get());
-	}
-
-	return IRQ_WAKE_THREAD;
-}
-
 /**
  * syna_dev_isr()
  *
@@ -973,6 +959,10 @@ static irqreturn_t syna_dev_isr(int irq, void *data)
 		goto exit;
 	}
 
+	if (code == REPORT_DELTA || code == REPORT_RAW || code == REPORT_DEBUG) {
+		syna_tcm_test_report(tcm, code);
+		goto exit;
+	}
 #ifdef ENABLE_EXTERNAL_FRAME_PROCESS
 	if (tcm->report_to_queue[code] == EFP_ENABLE) {
 		syna_tcm_buf_lock(&tcm->tcm_dev->external_buf);
@@ -985,6 +975,7 @@ static irqreturn_t syna_dev_isr(int irq, void *data)
 	}
 #endif
 	/* report input event only when receiving a touch report */
+
 	if (code == REPORT_TOUCH) {
 		/* parse touch report once received */
 		retval = syna_tcm_parse_touch_report(tcm->tcm_dev,
@@ -1041,14 +1032,14 @@ static int syna_dev_request_irq(struct syna_tcm *tcm)
 #ifdef DEV_MANAGED_API
 	retval = devm_request_threaded_irq(dev,
 			attn->irq_id,
-			tp_top_irq_thread_fn,
+			NULL,
 			syna_dev_isr,
 			attn->irq_flags,
 			PLATFORM_DRIVER_NAME,
 			tcm);
 #else /* Legacy API */
 	retval = request_threaded_irq(attn->irq_id,
-			tp_top_irq_thread_fn,
+			NULL,
 			syna_dev_isr,
 			attn->irq_flags,
 			PLATFORM_DRIVER_NAME,
@@ -1208,7 +1199,6 @@ static void syna_dev_reflash_startup_work(struct work_struct *work)
 	const struct firmware *fw_entry = NULL;
 	const unsigned char *fw_image = NULL;
 	unsigned int fw_image_size;
-	u64 start_time = 0;
 	struct syna_hw_attn_data *attn;
 
 	delayed_work = container_of(work, struct delayed_work, work);
@@ -1219,10 +1209,6 @@ static void syna_dev_reflash_startup_work(struct work_struct *work)
 	attn = &hw_if->bdata_attn;
 
 	syna_pal_mutex_lock(&tcm->extif_mutex);
-
-	if (tcm->health_monitor_support) {
-		reset_healthinfo_time_counter(&start_time);
-	}
 
 	/* get firmware image */
 	if (tcm->firmware_update_type == 1) {
@@ -1247,12 +1233,6 @@ static void syna_dev_reflash_startup_work(struct work_struct *work)
 	if (retval < 0) {
 		LOGE("Fail to request %s\n", (tcm->firmware_update_type == 1) ?
 				   tcm->fw_name_fae : tcm->panel_data.fw_name);
-		if (tcm->health_monitor_support) {
-			tp_healthinfo_report(&tcm->monitor_data, HEALTH_FW_UPDATE, "FW_Request_Failed");
-		}
-		if (tcm->exception_upload_support) {
-			tp_exception_report(&tcm->exception_data, EXCEP_FW_UPDATE, "FW_Request_Failed", sizeof("FW_Request_Failed"));
-		}
 		complete(&tcm->fw_complete);
 		syna_pal_mutex_unlock(&tcm->extif_mutex);
 		return;
@@ -1284,12 +1264,6 @@ static void syna_dev_reflash_startup_work(struct work_struct *work)
 #endif
 	if (retval < 0) {
 		LOGE("Fail to do reflash\n");
-		if (tcm->health_monitor_support) {
-			tp_healthinfo_report(&tcm->monitor_data, HEALTH_FW_UPDATE, "FW_Update_Failed");
-		}
-		if (tcm->exception_upload_support) {
-			tp_exception_report(&tcm->exception_data, EXCEP_FW_UPDATE, "FW_Update_Failed", sizeof("FW_Update_Failed"));
-		}
 		syna_pal_mutex_unlock(&hw_if->bdata_rst.reset_en_mutex);
 		goto exit;
 	}
@@ -1342,10 +1316,6 @@ exit:
 
 	pm_relax(&tcm->pdev->dev);
 
-	if (tcm->health_monitor_support) {
-		tp_healthinfo_report(&tcm->monitor_data, HEALTH_FW_UPDATE_COST, &start_time);
-	}
-
 	complete(&tcm->fw_complete);
 
 	syna_pal_mutex_unlock(&tcm->extif_mutex);
@@ -1360,16 +1330,11 @@ static void syna_dev_fw_update_in_bl(struct syna_tcm *tcm)
 	const struct firmware *fw_entry = NULL;
 	const unsigned char *fw_image = NULL;
 	unsigned int fw_image_size;
-	u64 start_time = 0;
 
 	tcm_dev = tcm->tcm_dev;
 	hw_if = tcm->hw_if;
 
 	syna_pal_mutex_lock(&tcm->extif_mutex);
-
-	if (tcm->health_monitor_support) {
-		reset_healthinfo_time_counter(&start_time);
-	}
 
 	/* get firmware image */
 	if (tcm->panel_data.fw_name) {
@@ -1384,12 +1349,6 @@ static void syna_dev_fw_update_in_bl(struct syna_tcm *tcm)
 	if (retval < 0) {
 		LOGE("Fail to request %s\n", (tcm->firmware_update_type == 1) ?
 				   tcm->fw_name_fae : tcm->panel_data.fw_name);
-		if (tcm->health_monitor_support) {
-			tp_healthinfo_report(&tcm->monitor_data, HEALTH_FW_UPDATE, "FW_Request_Failed");
-		}
-		if (tcm->exception_upload_support) {
-			tp_exception_report(&tcm->exception_data, EXCEP_FW_UPDATE, "FW_Request_Failed", sizeof("FW_Request_Failed"));
-		}
 		syna_pal_mutex_unlock(&tcm->extif_mutex);
 		return;
 	}
@@ -1420,12 +1379,6 @@ static void syna_dev_fw_update_in_bl(struct syna_tcm *tcm)
 #endif
 	if (retval < 0) {
 		LOGE("Fail to do reflash\n");
-		if (tcm->health_monitor_support) {
-			tp_healthinfo_report(&tcm->monitor_data, HEALTH_FW_UPDATE, "FW_Update_Failed");
-		}
-		if (tcm->exception_upload_support) {
-			tp_exception_report(&tcm->exception_data, EXCEP_FW_UPDATE, "FW_Update_Failed", sizeof("FW_Update_Failed"));
-		}
 		syna_pal_mutex_unlock(&hw_if->bdata_rst.reset_en_mutex);
 		goto exit;
 	}
@@ -1458,9 +1411,6 @@ exit:
 
 	pm_relax(&tcm->pdev->dev);
 
-	if (tcm->health_monitor_support) {
-		tp_healthinfo_report(&tcm->monitor_data, HEALTH_FW_UPDATE_COST, &start_time);
-	}
 	syna_pal_mutex_unlock(&tcm->extif_mutex);
 }
 /*#if defined(POWER_ALIVE_AT_SUSPEND) && !defined(RESET_ON_RESUME)*/
@@ -1594,7 +1544,6 @@ static void syna_speedup_resume(struct work_struct *work)
 	int retval;
 	struct syna_hw_interface *hw_if = tcm->hw_if;
 	bool irq_enabled = true;
-	u64 start_time = 0;
 
 	LOGI("%s is called\n", __func__);
 
@@ -1605,9 +1554,6 @@ static void syna_speedup_resume(struct work_struct *work)
 		return;
 	}
 
-	if (tcm->health_monitor_support) {
-		reset_healthinfo_time_counter(&start_time);
-	}
 	/*step1: get mutex for locking i2c acess flow*/
 	mutex_lock(&tcm->mutex);
 
@@ -1634,7 +1580,6 @@ static void syna_speedup_resume(struct work_struct *work)
 			LOGE("bootloader trigger fw update\n");
 			tcm->tcm_dev->firmware_mode_count = 0;
 			syna_dev_fw_update_in_bl(tcm);
-			tp_healthinfo_report(&tcm->monitor_data, HEALTH_FW_UPDATE, "syna_tcm_fw_update_new");
 		}
 		LOGI("Do reset on resume\n");
 		/*syna_pal_sleep_ms(RESET_ON_RESUME_DELAY_MS);*/
@@ -1704,9 +1649,6 @@ exit:
 	tcm->slept_in_early_suspend = false;
 
 	mutex_unlock(&tcm->mutex);
-	if (tcm->health_monitor_support) {
-		tp_healthinfo_report(&tcm->monitor_data, HEALTH_RESUME, &start_time);
-	}
 }
 /**
  * syna_dev_suspend()
@@ -1729,15 +1671,11 @@ static int syna_dev_suspend(struct device *dev)
 	struct syna_hw_interface *hw_if = tcm->hw_if;
 	struct touchpanel_event event_data;
 	bool irq_disabled = true;
-	u64 start_time = 0;
 
 	/* exit directly if device is already in suspend state */
 	if (tcm->pwr_state != PWR_ON)
 		return 0;
 
-	if (tcm->health_monitor_support) {
-		reset_healthinfo_time_counter(&start_time);
-	}
 	mutex_lock(&tcm->mutex);
 
 	if (IS_REMOVE == tcm->driver_current_state) {
@@ -1796,10 +1734,6 @@ static int syna_dev_suspend(struct device *dev)
 
 	tcm->sub_pwr_state = SUB_PWR_SUSPEND_DONE;
 	mutex_unlock(&tcm->mutex);
-
-	if (tcm->health_monitor_support) {
-		tp_healthinfo_report(&tcm->monitor_data, HEALTH_SUSPEND, &start_time);
-	}
 
 	return 0;
 }
@@ -1896,6 +1830,10 @@ static void ts_panel_notifier_callback(enum panel_event_notifier_tag tag,
 		LOGE("Invalid notification\n");
 		return;
 	}
+	if (!tcm || IS_REMOVE == tcm->driver_current_state) {
+		LOGE("%s: driver is remove!!\n", __func__);
+		return;
+	};
 	/* update lpwg_enabled based on gesture_type */
 	syna_dev_update_lpwg_status(tcm);
 
@@ -1972,6 +1910,11 @@ static int ts_mtk_drm_notifier_callback(struct notifier_block *nb,
 
 	LOGE("mtk gki notifier event:%lu, blank:%d",
 			event, *blank);
+
+	if (!tcm || IS_REMOVE == tcm->driver_current_state) {
+		LOGE("%s: driver is remove!!\n", __func__);
+		return 0;
+	};
 	/* update lpwg_enabled based on gesture_type */
 	syna_dev_update_lpwg_status(tcm);
 
@@ -2032,6 +1975,10 @@ static int fb_notifier_callback(struct notifier_block *self, unsigned long event
 
 	struct syna_tcm *tcm = container_of(nb, struct syna_tcm, fb_notifier);
 
+	if (!tcm || IS_REMOVE == tcm->driver_current_state) {
+		LOGE("%s: driver is remove!!\n", __func__);
+		return 0;
+	};
 	/*to aviod some kernel bug (at fbmem.c some local veriable are not initialized)*/
 #if IS_ENABLED(CONFIG_DRM_MSM) || IS_ENABLED(CONFIG_DRM_OPLUS_NOTIFY)
 	if (event != MSM_DRM_EARLY_EVENT_BLANK && event != MSM_DRM_EVENT_BLANK
@@ -2386,7 +2333,11 @@ static struct tcm_engineer_test_operations syna_tcm_engineer_test_ops = {
 };
 
 static struct debug_info_proc_operations syna_debug_proc_ops = {
+	.delta_read    = syna_delta_read,
+	.baseline_read = syna_baseline_read,
+	.baseline_blackscreen_read = syna_baseline_read,
 	.main_register_read = syna_main_register,
+	.reserve_read  = syna_reserve_read,
 };
 
 static void syna_start_aging_test(void *chip_data)
@@ -2690,7 +2641,6 @@ static int tp_paneldata_init(struct syna_tcm *pdata)
 	/*strncpy(tcm->panel_data.manufacture_info.fw_path, FW_IMAGE_NAME, MAX_FW_NAME_LENGTH - 1);
 	strncpy(tcm->panel_data.manufacture_info.manufacture, "BOE_HBP", 8);*/
 	strlcat(tcm->panel_data.manufacture_info.manufacture, hbp_postfix, MAX_DEVICE_MANU_LENGTH);
-	tcm->monitor_data.vendor = tcm->panel_data.manufacture_info.manufacture;
 
 	fw_name_tmp = devm_kzalloc(&tcm->pdev->dev, MAX_FW_NAME_LENGTH, GFP_KERNEL);
 
@@ -2776,11 +2726,8 @@ static int syna_dev_probe(struct platform_device *pdev)
 	void *cookie = NULL;
 	u8 retry;
 #endif
-	u64 time_counter = 0;
 
 	LOGI("%s is called.\n", __func__);
-
-	reset_healthinfo_time_counter(&time_counter);
 
 	hw_if = pdev->dev.platform_data;
 	if (!hw_if) {
@@ -2794,6 +2741,18 @@ static int syna_dev_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
+	tcm->test_hcd = (struct syna_tcm_test *)devm_kzalloc(&pdev->dev,
+		sizeof(struct syna_tcm_test), GFP_KERNEL);
+	if (!tcm->test_hcd) {
+		syna_pal_mem_free((void *)tcm);
+		LOGE("Fail to alloc tcm->test_hcd mem\n");
+		return -ENOMEM;
+	}
+
+	INIT_BUFFER(tcm->test_hcd->report, false);
+	INIT_BUFFER(tcm->test_hcd->test_resp, false);
+	INIT_BUFFER(tcm->test_hcd->test_out, false);
+
 	/* allocate the TouchCom device handle
 	 * recommend to set polling mode here because isr is not registered yet
 	 */
@@ -2802,26 +2761,13 @@ static int syna_dev_probe(struct platform_device *pdev)
 		LOGE("Fail to allocate TouchCom device handle\n");
 		goto err_allocate_cdev;
 	}
-
-	retval = tp_healthinfo_init(&pdev->dev, &tcm->monitor_data);
-
 	if (retval < 0) {
 		TP_INFO(tcm->tp_index, "health info init failed.\n");
-		tcm->monitor_data.health_monitor_support = false;
-	} else {
-		tcm->monitor_data.health_monitor_support = true;
-		tcm->health_monitor_support = true;
-		/*tcm->monitor_data.debug_info_ops = tcm->debug_info_ops;*/
 	}
-
-	tcm->exception_upload_support = true;
-	tcm->exception_data.exception_upload_support = true;
-	tcm->exception_data.chip_data = tcm;
 
 	tcm->tcm_dev = tcm_dev;
 	tcm->pdev = pdev;
 	tcm->hw_if = hw_if;
-	tcm_dev->monitor_data = &tcm->monitor_data;
 	tcm->frame_over_cnt_report_en = 1;
 
 	syna_spi_pdev = syna_spi_device->dev.parent;
@@ -2903,6 +2849,7 @@ static int syna_dev_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, tcm);
 
 	device_init_wakeup(&pdev->dev, 1);
+	init_completion(&tcm->report_complete);
 
 /* ts check panel dt */
 #if IS_ENABLED(CONFIG_DRM_OPLUS_PANEL_NOTIFY) || IS_ENABLED(CONFIG_QCOM_PANEL_EVENT_NOTIFIER)
@@ -3022,9 +2969,6 @@ static int syna_dev_probe(struct platform_device *pdev)
 
 	tcm->probe_done = 1;
 
-	if (tcm->health_monitor_support) {
-		tp_healthinfo_report(&tcm->monitor_data, HEALTH_PROBE, &time_counter);
-	}
 	LOGI("TouchComm driver, %s v%d.%s installed\n",
 		PLATFORM_DRIVER_NAME,
 		SYNAPTICS_TCM_DRIVER_VERSION,
@@ -3041,9 +2985,6 @@ err_create_cdev:
 err_manufacture_info:
 err_connect:
 #endif
-	if (tcm->exception_upload_support) {
-		tp_exception_report(&tcm->exception_data, EXCEP_PROBE, "tp_probe_failed", sizeof("tp_probe_failed"));
-	}
 	syna_tcm_buf_release(&tcm->event_data);
 	mutex_destroy(&tcm->mutex);
 	syna_pal_mutex_free(&tcm->tp_event_mutex);
@@ -3088,6 +3029,20 @@ static int syna_dev_remove(struct platform_device *pdev)
 	destroy_workqueue(tcm->helper.workqueue);
 #endif
 
+#ifdef HAS_SYSFS_INTERFACE
+	/* remove the cdev and sysfs nodes */
+	syna_cdev_remove_sysfs(tcm);
+	platform_set_drvdata(pdev, NULL);
+#endif
+
+	/* check the connection status, and do disconnection */
+	if (tcm->dev_disconnect(tcm) < 0)
+		LOGE("Fail to do device disconnection\n");
+
+	if (tcm->userspace_app_info != NULL)
+		syna_pal_mem_free(tcm->userspace_app_info);
+
+	mutex_unlock(&tcm->mutex);
 	/*step7 : suspend && resume fuction register*/
 #if IS_ENABLED(CONFIG_DRM_OPLUS_PANEL_NOTIFY)
 	if (tcm->active_panel && tcm->fb_notifier.notifier_call) {
@@ -3126,21 +3081,6 @@ static int syna_dev_remove(struct platform_device *pdev)
 	}
 
 #endif/*CONFIG_FB*/
-
-#ifdef HAS_SYSFS_INTERFACE
-	/* remove the cdev and sysfs nodes */
-	syna_cdev_remove_sysfs(tcm);
-	platform_set_drvdata(pdev, NULL);
-#endif
-
-	/* check the connection status, and do disconnection */
-	if (tcm->dev_disconnect(tcm) < 0)
-		LOGE("Fail to do device disconnection\n");
-
-	if (tcm->userspace_app_info != NULL)
-		syna_pal_mem_free(tcm->userspace_app_info);
-
-	mutex_unlock(&tcm->mutex);
 	/*mutex_destroy(&tcm->mutex);*/
 	syna_tcm_buf_release(&tcm->event_data);
 
@@ -3526,6 +3466,257 @@ static void syna_main_register(struct seq_file *s, void *chip_data)
 	}
 	seq_printf(s, "DC_GESTURE_MASK:%d\n", config);
 	TPD_INFO("DC_GESTURE_MASK:%d\n", config);
+	return;
+}
+
+static void syna_tcm_format_print(struct seq_file *s,
+				  struct syna_tcm *tcm_info, char *buffer)
+{
+	unsigned int row, col;
+	unsigned int rows, cols;
+	unsigned int cnt = 0;
+	short *pdata_16;
+	struct syna_tcm_test *test_hcd = tcm_info->test_hcd;
+
+	rows = le2_to_uint(tcm_info->tcm_dev->app_info.num_of_image_rows);
+	cols = le2_to_uint(tcm_info->tcm_dev->app_info.num_of_image_cols);
+
+	TPD_INFO("report size:%d\n", test_hcd->report.data_length);
+
+	if (buffer == NULL) {
+		pdata_16 = (short *)&test_hcd->report.buf[0];
+	} else {
+		pdata_16 = (short *)buffer;
+	}
+
+	for (row = 0; row < rows; row++) {
+		seq_printf(s, "[%02d] ", row);
+		for (col = 0; col < cols; col++) {
+			seq_printf(s, "%5d ", *pdata_16);
+			pdata_16++;
+		}
+		seq_printf(s, "\n");
+	}
+
+	if (test_hcd->report.data_length == rows * cols * 2 + (rows + cols) * 2) {
+		for (cnt = 0; cnt < rows + cols; cnt++) {
+			seq_printf(s, "%5d ", *pdata_16);
+			pdata_16++;
+		}
+	}
+
+	seq_printf(s, "\n");
+
+	return;
+}
+
+static void syna_tcm_test_report(struct syna_tcm *tcm_info, u32 code)
+{
+	int retval;
+	unsigned int offset, report_size;
+	struct syna_tcm_test *test_hcd = tcm_info->test_hcd;
+
+	if (code != test_hcd->report_type) {
+		TPD_INFO("Not request report type\n");
+		return;
+	}
+
+	report_size = tcm_info->event_data.data_length;
+	LOCK_BUFFER(test_hcd->report);
+
+	if (test_hcd->report_index == 0) {
+		retval = syna_tcm_alloc_mem(&test_hcd->report, report_size * test_hcd->num_of_reports);
+		if (retval < 0) {
+			TPD_INFO("Failed to allocate memory\n");
+			UNLOCK_BUFFER(test_hcd->report);
+			return;
+		}
+	}
+
+	if (test_hcd->report_index < test_hcd->num_of_reports) {
+		offset = report_size * test_hcd->report_index;
+		retval = tp_memcpy(test_hcd->report.buf + offset,
+			test_hcd->report.buf_size - offset,
+			tcm_info->event_data.buf,
+			tcm_info->event_data.buf_size,
+			tcm_info->event_data.data_length);
+		if (retval < 0) {
+			TPD_INFO("Failed to copy report data\n");
+			UNLOCK_BUFFER(test_hcd->report);
+			return;
+		}
+
+		test_hcd->report_index++;
+		test_hcd->report.data_length += report_size;
+	}
+
+	UNLOCK_BUFFER(test_hcd->report);
+
+	if (test_hcd->report_index == test_hcd->num_of_reports) {
+		complete(&tcm_info->report_complete);
+	}
+
+	return;
+}
+
+#define REPORT_TIMEOUT_MS       1000
+
+static int syna_tcm_collect_reports(struct syna_tcm *tcm_info,
+				    enum tcm_report_type report_type, unsigned int num_of_reports)
+{
+	int retval;
+	bool completed = false;
+	struct syna_tcm_test *test_hcd = tcm_info->test_hcd;
+	unsigned char out[2] = {0};
+	unsigned char resp_code;
+	unsigned int timeout;
+
+	test_hcd->report_index = 0;
+	test_hcd->report_type = report_type;
+	test_hcd->num_of_reports = num_of_reports;
+
+	reinit_completion(&tcm_info->report_complete);
+
+	out[0] = test_hcd->report_type;
+
+	retval = tcm_info->tcm_dev->write_message(tcm_info->tcm_dev,
+					CMD_ENABLE_REPORT,
+					out,
+					1,
+					&resp_code,
+					tcm_info->tcm_dev->msg_data.default_resp_reading);
+
+	if (retval < 0) {
+		TPD_INFO("Failed to write message %s retval %d\n", STR(CMD_ENABLE_REPORT), retval);
+		completed = false;
+		goto exit;
+	}
+
+	timeout = REPORT_TIMEOUT_MS * num_of_reports;
+
+	retval = wait_for_completion_timeout(&tcm_info->report_complete,
+					     msecs_to_jiffies(timeout));
+
+	if (retval == 0) {
+		TPD_INFO("Timed out waiting for report collection\n");
+	} else {
+		completed = true;
+	}
+	out[0] = test_hcd->report_type;
+
+	retval = tcm_info->tcm_dev->write_message(tcm_info->tcm_dev,
+					CMD_DISABLE_REPORT,
+					out,
+					1,
+					&resp_code,
+					tcm_info->tcm_dev->msg_data.default_resp_reading);
+
+	if (retval < 0) {
+		TPD_INFO("Failed to write message %s retval %d\n", STR(CMD_DISABLE_REPORT), retval);
+	}
+
+	if (!completed) {
+		retval = -EIO;
+	}
+
+exit:
+
+	return retval;
+}
+
+static void syna_delta_read(struct seq_file *s, void *chip_data)
+{
+	int retval;
+	struct syna_tcm *tcm_info = (struct syna_tcm *)chip_data;
+
+	retval = syna_tcm_set_dynamic_config(tcm_info->tcm_dev, DC_NO_DOZE, 1, 0);
+
+	if (retval < 0) {
+		TPD_INFO("Failed to exit doze\n");
+	}
+
+	msleep(20); /* delay 20ms*/
+
+	retval = syna_tcm_collect_reports(tcm_info, REPORT_DELTA, 1);
+
+	if (retval < 0) {
+		seq_printf(s, "Failed to read delta data\n");
+		return;
+	}
+
+	syna_tcm_format_print(s, tcm_info, NULL);
+
+	/*set normal doze*/
+	retval = syna_tcm_set_dynamic_config(tcm_info->tcm_dev, DC_NO_DOZE, 0, 0);
+
+	if (retval < 0) {
+		TPD_INFO("Failed to switch to normal\n");
+	}
+
+	return;
+}
+
+
+static void syna_baseline_read(struct seq_file *s, void *chip_data)
+{
+	int retval;
+	struct syna_tcm *tcm_info = (struct syna_tcm *)chip_data;
+
+	retval = syna_tcm_set_dynamic_config(tcm_info->tcm_dev, DC_NO_DOZE, 1, 0);
+
+	if (retval < 0) {
+		TPD_INFO("Failed to exit doze\n");
+	}
+
+	msleep(20); /* delay 20ms*/    // delete temply, msleep lead to restart
+
+	retval = syna_tcm_collect_reports(tcm_info, REPORT_RAW, 1);
+	if (retval < 0) {
+		seq_printf(s, "Failed to read baseline data\n");
+		return;
+	}
+
+	syna_tcm_format_print(s, tcm_info, NULL);
+
+	/*set normal doze*/
+	retval = syna_tcm_set_dynamic_config(tcm_info->tcm_dev, DC_NO_DOZE, 0, 0);
+
+	if (retval < 0) {
+		TPD_INFO("Failed to switch to normal\n");
+	}
+
+	return;
+}
+
+static void syna_reserve_read(struct seq_file *s, void *chip_data)
+{
+	int retval;
+	struct syna_tcm *tcm_info = (struct syna_tcm *)chip_data;
+
+	retval = syna_tcm_set_dynamic_config(tcm_info->tcm_dev, DC_NO_DOZE, 1, 0);
+
+	if (retval < 0) {
+		TPD_INFO("Failed to exit doze\n");
+	}
+
+	msleep(20); /* delay 20ms*/
+
+	retval = syna_tcm_collect_reports(tcm_info, REPORT_DEBUG, 1);
+
+	if (retval < 0) {
+		seq_printf(s, "Failed to read delta data\n");
+		return;
+	}
+
+	syna_tcm_format_print(s, tcm_info, NULL);
+
+	/*set normal doze*/
+	retval = syna_tcm_set_dynamic_config(tcm_info->tcm_dev, DC_NO_DOZE, 0, 0);
+
+	if (retval < 0) {
+		TPD_INFO("Failed to switch to normal\n");
+	}
+
 	return;
 }
 
