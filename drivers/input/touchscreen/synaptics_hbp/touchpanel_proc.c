@@ -15,7 +15,7 @@
 #include <linux/rtc.h>
 #include <linux/syscalls.h>
 #include <linux/version.h>
-#include "../touchpanel_notify/touchpanel_event_notify.h"
+#include "../oplus_touchscreen_v2/touchpanel_notify/touchpanel_event_notify.h"
 #include "touchpanel_autotest/touchpanel_autotest.h"
 #include "touch_comon_api/touch_comon_api.h"
 #include "tcm/synaptics_touchcom_func_base.h"

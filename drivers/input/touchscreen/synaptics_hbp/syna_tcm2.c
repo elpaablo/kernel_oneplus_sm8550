@@ -52,7 +52,7 @@
 #endif
 #include "touchpanel_proc.h"
 #include "synaptics_common.h"
-#include "../touchpanel_notify/touchpanel_event_notify.h"
+#include "../oplus_touchscreen_v2/touchpanel_notify/touchpanel_event_notify.h"
 #include "touchpanel_autotest/touchpanel_autotest.h"
 #include "touch_comon_api/touch_comon_api.h"
 
