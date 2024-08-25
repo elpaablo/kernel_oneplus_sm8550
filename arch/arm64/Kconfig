@@ -2162,7 +2162,14 @@ config ASTON_DTB
 	default n
 	bool "Oplus aston device DTB"
 	help
-	  Only include Oplus aston device specific device tree. 
+	  Only include Oplus aston device specific device tree.
+
+config XIGUA_DTB
+	select OPLUS_DEVICE_DTBS
+	default n
+	bool "Oplus xigua device DTB"
+	help
+	  Only include Oplus xigua device specific device tree.
 
 endmenu
 
